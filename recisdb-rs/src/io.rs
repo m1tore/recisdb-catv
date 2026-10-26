@@ -14,6 +14,14 @@ use pin_project_lite::pin_project;
 
 use b25_sys::{DecoderOptions, StreamDecoder};
 
+// プロセス全体の終了シグナル保持フラグ
+static GLOBAL_ABORT: AtomicBool = AtomicBool::new(false);
+
+// シグナルによる中断要求の有無を返す
+pub(crate) fn is_aborted() -> bool {
+    GLOBAL_ABORT.load(Ordering::Relaxed)
+}
+
 pin_project! {
     pub(crate) struct AsyncInOutTriple {
         #[pin]
@@ -63,6 +71,7 @@ impl AsyncInOutTriple {
         let abort: Arc<AtomicBool> = Default::default();
         let weak = Arc::downgrade(&abort);
         ctrlc::set_handler(move || {
+            GLOBAL_ABORT.store(true, Ordering::Relaxed);
             if let Some(ptr) = weak.upgrade() {
                 ptr.store(true, Ordering::Relaxed)
             }

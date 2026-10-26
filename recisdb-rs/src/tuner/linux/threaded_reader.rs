@@ -90,6 +90,15 @@ impl ThreadedReader {
         chunk_size: usize,
         queue_capacity: usize,
     ) -> io::Result<Self> {
+        Self::new_with_slot(source, chunk_size, queue_capacity, None)
+    }
+
+    pub fn new_with_slot<R: Read + Send + AsRawFd + 'static>(
+        source: R,
+        chunk_size: usize,
+        queue_capacity: usize,
+        tsmf_slot: Option<u8>,
+    ) -> io::Result<Self> {
         let (sender, receiver) = sync_channel(queue_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
@@ -97,7 +106,7 @@ impl ThreadedReader {
         let reader_thread = thread::Builder::new()
             .name("tuner-reader".to_string())
             .spawn(move || {
-                Self::reader_loop(source, sender, chunk_size, shutdown_clone);
+                Self::reader_loop(source, sender, chunk_size, shutdown_clone, tsmf_slot);
             })?;
 
         debug!(
@@ -123,9 +132,16 @@ impl ThreadedReader {
     /// - RECISDB_TUNER_CHUNK_SIZE_BYTES
     /// - RECISDB_TUNER_QUEUE_CAPACITY
     pub fn with_defaults<R: Read + Send + AsRawFd + 'static>(source: R) -> io::Result<Self> {
+        Self::with_tsmf_slot(source, None)
+    }
+
+    pub fn with_tsmf_slot<R: Read + Send + AsRawFd + 'static>(
+        source: R,
+        tsmf_slot: Option<u8>,
+    ) -> io::Result<Self> {
         let chunk_size = Self::read_usize_env(ENV_TUNER_CHUNK_SIZE_BYTES, DEFAULT_CHUNK_SIZE);
         let queue_capacity = Self::read_usize_env(ENV_TUNER_QUEUE_CAPACITY, DEFAULT_QUEUE_CAPACITY);
-        Self::new(source, chunk_size, queue_capacity)
+        Self::new_with_slot(source, chunk_size, queue_capacity, tsmf_slot)
     }
 
     fn read_usize_env(name: &str, fallback: usize) -> usize {
@@ -154,12 +170,26 @@ impl ThreadedReader {
         sender: SyncSender<io::Result<Vec<u8>>>,
         chunk_size: usize,
         shutdown: Arc<AtomicBool>,
+        tsmf_slot: Option<u8>,
     ) {
         let fd = source.as_raw_fd();
+        let mut rem: Vec<u8> = Vec::with_capacity(188);
+        let mut slot_map = [0u8; 52];
+        let mut pkt_idx: i32 = -1;
+        let mut active_slot: Option<u8> = tsmf_slot;
+        let mut last_data_time = Instant::now();
 
         loop {
-            // Check shutdown flag before doing any work
-            if shutdown.load(Ordering::Relaxed) {
+            // 終了フラグまたはシグナル受信時はループを終了する
+            if shutdown.load(Ordering::Relaxed) || crate::io::is_aborted() {
+                break;
+            }
+            // 無信号状態が継続した場合はタイムアウトで終了する
+            if last_data_time.elapsed() >= Duration::from_secs(6) {
+                let _ = sender.send(Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "No stream data received from tuner.",
+                )));
                 break;
             }
 
@@ -228,11 +258,92 @@ impl ThreadedReader {
                 }
                 Ok(bytes_read) => {
                     buf.truncate(bytes_read);
-                    // If send fails, the receiver has been dropped
-                    // (consumer is done), so we exit the loop
-                    if sender.send(Ok(buf)).is_err() {
-                        break;
+
+                    // 53パケット構成のTSMFフレームをソフトウェアで分離する
+                    let mut work = if rem.is_empty() {
+                        buf
+                    } else {
+                        let mut combined = Vec::with_capacity(rem.len() + buf.len());
+                        combined.extend_from_slice(&rem);
+                        combined.extend_from_slice(&buf);
+                        rem.clear();
+                        combined
+                    };
+
+                    if work.len() < 188 {
+                        if pkt_idx < 0 && active_slot.is_none() {
+                            if sender.send(Ok(work)).is_err() {
+                                break;
+                            }
+                        } else {
+                            rem.extend_from_slice(&work);
+                        }
+                        continue;
                     }
+
+                    // 先頭同期バイトの位置を検出する
+                    let mut start_off = 0usize;
+                    if work[0] != 0x47 {
+                        if let Some(pos) = work.iter().position(|&b| b == 0x47) {
+                            start_off = pos;
+                        }
+                    }
+
+                    let usable = work.len() - start_off;
+                    let full_len = (usable / 188) * 188;
+                    let end_off = start_off + full_len;
+                    if end_off < work.len() {
+                        rem.extend_from_slice(&work[end_off..]);
+                    }
+
+                    let mut out = Vec::with_capacity(full_len);
+                    for pkt in work[start_off..end_off].chunks_exact(188) {
+                        if pkt[0] == 0x47 {
+                            let pid = (((pkt[1] & 0x1F) as u16) << 8) | (pkt[2] as u16);
+                            if pid == 0x002F {
+                                let fsync = (((pkt[4] & 0x1F) as u16) << 8) | (pkt[5] as u16);
+                                if fsync == 0x1A86 || fsync == 0x0579 {
+                                    if active_slot.is_none() {
+                                        for s in 0..15usize {
+                                            let off = 9 + s * 4;
+                                            let tsid = ((pkt[off] as u16) << 8) | (pkt[off + 1] as u16);
+                                            let onid = ((pkt[off + 2] as u16) << 8) | (pkt[off + 3] as u16);
+                                            if tsid != 0x0000 && tsid != 0xFFFF && onid != 0xFFFF {
+                                                active_slot = Some((s + 1) as u8);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    for k in 0..52usize {
+                                        let b = pkt[73 + k / 2];
+                                        slot_map[k] = if k % 2 == 0 { b >> 4 } else { b & 0x0F };
+                                    }
+                                    pkt_idx = 0;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if (0..52).contains(&pkt_idx) {
+                            let cur_slot = slot_map[pkt_idx as usize];
+                            pkt_idx += 1;
+                            if Some(cur_slot) == active_slot {
+                                out.extend_from_slice(pkt);
+                            }
+                        } else {
+                            out.extend_from_slice(pkt);
+                        }
+                    }
+
+                    if !out.is_empty() {
+                        last_data_time = Instant::now();
+                        // If send fails, the receiver has been dropped
+                        // (consumer is done), so we exit the loop
+                        if sender.send(Ok(out)).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = &mut work;
                 }
                 // Interrupted by a signal (EINTR): retry immediately.
                 // This is a transient condition that can occur when signals
@@ -319,29 +430,30 @@ impl Read for ThreadedReader {
             return Ok(copy_size);
         }
 
-        // No pending data; block until the reader thread sends the next chunk
+        // タイムアウト付き受信でシグナル中断を監視する
         let receiver = match self.receiver.as_ref() {
             Some(receiver) => receiver,
             None => return Ok(0),
         };
-        match receiver.recv() {
-            // EOF signaled by the reader thread (empty Vec)
-            Ok(Ok(data)) if data.is_empty() => Ok(0),
-            Ok(Ok(data)) => {
-                let copy_size = data.len().min(buf.len());
-                buf[..copy_size].copy_from_slice(&data[..copy_size]);
-                // If the received chunk is larger than buf, save the
-                // remainder for subsequent read() calls
-                if data.len() > copy_size {
-                    self.pending = data;
-                    self.offset = copy_size;
-                }
-                Ok(copy_size)
+        loop {
+            if crate::io::is_aborted() {
+                return Ok(0);
             }
-            // I/O error forwarded from the reader thread
-            Ok(Err(io_error)) => Err(io_error),
-            // Sender dropped unexpectedly; treat as EOF
-            Err(_) => Ok(0),
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(data)) if data.is_empty() => return Ok(0),
+                Ok(Ok(data)) => {
+                    let copy_size = data.len().min(buf.len());
+                    buf[..copy_size].copy_from_slice(&data[..copy_size]);
+                    if data.len() > copy_size {
+                        self.pending = data;
+                        self.offset = copy_size;
+                    }
+                    return Ok(copy_size);
+                }
+                Ok(Err(io_error)) => return Err(io_error),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+            }
         }
     }
 }

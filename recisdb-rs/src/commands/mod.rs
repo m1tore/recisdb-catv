@@ -23,6 +23,8 @@ use crate::io::AsyncInOutTriple;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::tuner::{Tunable, UnTunedTuner};
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) mod scan;
 pub(crate) mod utils;
 
 /// The behavior the user requested are returned.
@@ -44,13 +46,22 @@ pub(crate) fn process_command(
 
     match args.command {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
+        Commands::Scan { .. } => {
+            unreachable!("Handled in main.rs");
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         Commands::Checksignal {
             channel,
+            channel_type,
+            tsmf_slot,
             device,
             lnb,
         } => {
             // Get channel
-            let channel = channel.map(|ch| Channel::new(ch, None)).unwrap();
+            let channel = channel
+                .map(|ch| Channel::new_with_type(ch, channel_type.as_deref(), tsmf_slot, None))
+                .unwrap();
             if let ChannelType::BS(_, TsFilter::RelTsNum(num)) = channel.ch_type {
                 warn!("The specified relative TS num '_{}' has no effect.", num)
             }
@@ -75,18 +86,20 @@ pub(crate) fn process_command(
                 Err(e) => utils::error_handler::handle_tuning_error(e),
             };
 
-            // ctrlc::set_handler(|| std::process::exit(0)).expect("Error setting Ctrl-C handler");
-
             loop {
                 print!("\r{:.2}dB", tuned.signal_quality());
                 std::io::stdout().flush().unwrap();
                 std::thread::sleep(Duration::from_secs_f64(1.0).into())
             }
         }
+
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         Commands::Tune {
             device,
             channel,
+            channel_type,
+            tsmf_slot,
+            scan,
             card,
             tsid,
             time,
@@ -99,6 +112,15 @@ pub(crate) fn process_command(
             output,
             exit_on_card_error,
         } => {
+            // Mirakurunスキャン保護制御
+            if scan {
+                let is_gr = channel_type.as_deref().map(|t| t.to_uppercase() == "GR").unwrap_or(false);
+                if !is_gr {
+                    error!("Non-GR scan via Mirakurun scan API is disabled. Please use 'recisdb-catv scan'.");
+                    std::process::exit(1);
+                }
+            }
+
             // Card reader
             if let Some(name) = card {
                 #[cfg(not(feature = "prioritized_card_reader"))]
@@ -109,7 +131,9 @@ pub(crate) fn process_command(
             }
 
             // Get channel
-            let channel = channel.map(|ch| Channel::new(ch, tsid)).unwrap();
+            let channel = channel
+                .map(|ch| Channel::new_with_type(ch, channel_type.as_deref(), tsmf_slot, tsid))
+                .unwrap();
             if let ChannelType::Undefined = channel.ch_type {
                 error!("The specified channel is invalid.");
                 std::process::exit(1);
@@ -162,6 +186,7 @@ pub(crate) fn process_command(
             info!("Recording...");
             (body, rec_duration, None)
         }
+
         Commands::Decode {
             source,
             card,
@@ -171,7 +196,6 @@ pub(crate) fn process_command(
             no_strip,
             output,
         } => {
-            // Card reader
             if let Some(name) = card {
                 #[cfg(not(feature = "prioritized_card_reader"))]
                 warn!("--card {name} has no effect. Use `prioritized_card_reader` feature flag.");
@@ -180,7 +204,6 @@ pub(crate) fn process_command(
                 b25_sys::set_card_reader_name(&name);
             }
 
-            // in, out, dec
             let (input, input_sz) = utils::get_file_src(source)
                 .map_err(|e| {
                     error!("Failed to open input source: {}", e);
@@ -204,20 +227,10 @@ pub(crate) fn process_command(
             info!("Decoding...");
             (body, None, input_sz.map(|sz| (sz, progress)))
         }
+
         #[cfg(windows)]
         Commands::Enumerate { device, space } => {
-            // Open tuner
-            let untuned = UnTunedTuner::new(device, buf_sz)
-                .map_err(|e| utils::error_handler::handle_opening_error(e.into()))
-                .unwrap();
-            if let Some(spacename_channels) = untuned.enum_channels(space) {
-                for item in spacename_channels {
-                    println!("{}", item)
-                }
-                std::process::exit(0)
-            } else {
-                std::process::exit(1)
-            }
+            unimplemented!()
         }
     }
 }

@@ -8,6 +8,7 @@ use futures_util::{AsyncBufRead, AsyncRead};
 use log::warn;
 
 use crate::channels::output::IoctlFreq;
+use crate::channels::representation::TsFilter;
 use crate::channels::{Channel, ChannelType};
 use crate::tuner::Voltage;
 
@@ -58,11 +59,17 @@ impl UnTunedTuner {
             }),
         };
 
+        // チャンネル指定のTSMF相対スロット番号を抽出する
+        let tsmf_slot = match ch.ch_type {
+            ChannelType::Catv(_, TsFilter::RelTsNum(s)) if (1..=15).contains(&s) => Some(s as u8),
+            _ => None,
+        };
+
         // Wrap the data file in ThreadedReader so that a dedicated background
         // thread continuously drains the kernel's tuner buffer, preventing
         // data drops when the downstream decoder pipeline blocks (e.g.,
         // during B-CAS card ECM processing).
-        let reader = ThreadedReader::with_defaults(self.file)?;
+        let reader = ThreadedReader::with_tsmf_slot(self.file, tsmf_slot)?;
 
         Ok(Tuner {
             // Field order matters for drop safety: _lnb_capab is dropped
@@ -107,7 +114,9 @@ impl Tuner {
         };
 
         match self.channel.ch_type {
-            ChannelType::Terrestrial(..) => {
+            ChannelType::Terrestrial(..)
+            | ChannelType::Catv(..)
+            | ChannelType::DirectFreq(..) => {
                 let p = (5505024.0 / (raw as f64)).log10() * 10.0;
                 (0.000024 * p * p * p * p) - (0.0016 * p * p * p)
                     + (0.0398 * p * p)
@@ -147,6 +156,7 @@ impl Tuner {
             }
         }
     }
+    #[allow(dead_code)]
     fn tune(mut self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, std::io::Error> {
         let _errno = unsafe { set_ch(self.ioctl_file.as_raw_fd(), &ch.ch_type.clone().into())? };
 
@@ -198,10 +208,9 @@ impl Drop for PowerOffHandle {
         if self.is_disarmed {
             return;
         }
-
-        let disable_result = unsafe { ptx_disable_lnb(self.fd) };
-        if let Err(error) = disable_result {
-            warn!("Failed to disable LNB in PowerOffHandle::drop: {error}");
+        unsafe {
+            let _ = stop_rec(self.fd);
+            let _ = ptx_disable_lnb(self.fd);
         }
     }
 }

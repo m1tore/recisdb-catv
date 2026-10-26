@@ -1,270 +1,150 @@
-recisdb
-=======
+# recisdb-catv
 
-![ci workflow](https://github.com/kazuki0824/recisdb-rs/actions/workflows/rust.yml/badge.svg)
-[![Release](https://github.com/kazuki0824/recisdb-rs/actions/workflows/release.yml/badge.svg)](https://github.com/kazuki0824/recisdb-rs/actions/workflows/release.yml)
-
-Rust で書かれたテレビチューナーリーダー / ARIB STD-B25 デコーダーです。  
-従来の recpt1 / dvbv5-zap / b25 / arib-b25-stream-test コマンドの代替として利用できます。
-
-Tools for reading ARIB STD-B25, and dealing with some kinds of tuner devices. Works fine on Windows and Linux, with decode-only support on macOS.
-recisdb-rs and b25-sys are more convenient Rust wrapper for libaribb25. recisdb can read both Unix character device-based and BonDriver-based TV sources. 
+Rust で書かれたテレビチューナーリーダー / ARIB STD-B25 デコーダーである [recisdb](https://github.com/kazuki0824/recisdb-rs) をベースに、日本国内のケーブルテレビ（ISDB-C / CATV）および TBS6281SE v2 の PTX 互換ドライバ向けに拡張したフォーク版です。
 
 ---
 
-## Features
+## 本家（recisdb）との違い
 
-- クロスプラットフォーム (BonDriver / キャラクタデバイス (chardev) / DVBv5 デバイスすべてに対応)
-- Rust による実装でシングルボード向け低メモリ消費、連続録画時のエラー防止を目指す
-- チャンネル名ハードコード・二重バッファなど、従来のソフトウェアの設計の問題を自分なりに修正
-- ECM/EMM ロギング・デバッグ機能
+本家 `recisdb` の基本機能（ISDB-T / ISDB-S の受信や B25 デコードなど）をそのまま継承しつつ、以下の機能を追加・拡張しています。
 
-## Description
-
-- recisdb-rs: reads a bitstream from both character devices and BonDriver
-- b25-sys: a wrapper for libaribb25 written in Rust
-
-## Installation
-
-[Releases](https://github.com/kazuki0824/recisdb-rs/releases) に Ubuntu 20.04 以降向けの Debian パッケージ (.deb) と、Windows (x64) 向けの実行ファイル (.exe) を用意しています。  
-
-Linux では、下記のコマンドで recisdb をインストールできます。  
-以下は v1.2.4 をインストールする例です。依存パッケージは自動的にインストールされます。
-
-```bash
-# x86_64 環境
-wget https://github.com/kazuki0824/recisdb-rs/releases/download/1.2.4/recisdb_1.2.4-1_amd64.deb
-sudo apt install ./recisdb_1.2.4-1_amd64.deb
-rm ./recisdb_1.2.4-1_amd64.deb
-
-# arm64 環境
-wget https://github.com/kazuki0824/recisdb-rs/releases/download/1.2.4/recisdb_1.2.4-1_arm64.deb
-sudo apt install ./recisdb_1.2.4-1_arm64.deb
-rm ./recisdb_1.2.4-1_arm64.deb
-```
-Windows では `recisdb.exe` をダウンロードし、適当なフォルダに配置してください。
+1. **JCTEA / ISDB-C（ケーブルテレビ）の完全対応**
+   * CATV 帯（C13〜C63）および UHF 帯 ISDB-C（13〜62）の選局パラメータに対応。
+   * 64QAM / 256QAM 自動追従スルー選局に対応し、CATV トランスモジュレーション波（BS / 専門チャンネル等）を受信可能。
+2. **C-NIT ベースの高速チャンネルスキャン機能（`scan` サブコマンド）**
+   * CATV 帯域を自動走査し、C-NIT（Cable NIT）および SDT / TSMF 情報を自動解析。
+   * Mirakurun 向けの `channels.yml` を一発で自動生成可能。
+   * CATV 専門チャンネルはデフォルトで `type: CS` として出力（`--catv` オプションで `type: CATV` に切り替え可能）。
+3. **TSMF（複数TS多重化方式）のスロット分離**
+   * 同一周波数に複数番組がスロット多重されている TSMF 搬送波から、指定スロットの TS のみを分離抽出可能。
+4. **PTX 互換キャラクタデバイス向けチューニング**
+   * TBS6281SE v2（`/dev/tbs6281video*`）の Linux PTX 互換ドライバ（[m1tore/TBS6281SEv2_drv](https://github.com/m1tore/TBS6281SEv2_drv)）との併用を推奨。
 
 ---
 
-## Usage
+## インストール（ビルド）手順
 
-### General
+Rust の開発環境が必要です。未インストールの場合は [Rustup](https://www.rust-lang.org/ja/tools/install) をインストールしてください。
 
-recisdb には、プラットフォームに応じて次のサブコマンドがあります。
+### 1. 依存ツールのインストール（Ubuntu / Debian 例）
 
-- Linux: `checksignal`, `tune`, `decode`
-- Windows: `checksignal`, `tune`, `decode`, `enumerate`
-- macOS: `decode`
-
-`recisdb checksignal` : チャンネルを選局し、信号レベル (dB) を確認します。
 ```bash
-recisdb checksignal [OPTIONS] --device <CANONICAL_PATH> --channel <CHANNEL>
-```  
-
-`recisdb tune` : チャンネルを選局し、指定された出力先に受信した TS データを書き出します。
-```bash
-recisdb tune [OPTIONS] --device <CANONICAL_PATH> --channel <CHANNEL> <OUTPUT>
-```
-> [!NOTE]  
-> **v1.1.0 から `--no-simd` オプションが追加されました。**  
-> decode 時に SIGILL が発生する場合、AVX2 命令がご使用の CPU に実装されていないことが考えられます。
-> その際はこのオプションを使用することで問題を回避できます。
-
-> [!NOTE]  
-> **v1.2.0 から `-e` / `--exit-on-card-error` オプションが追加されました。**  
-> B-CAS カードの抜き取りなどの理由でデコーダーがエラーを返した場合、プログラムを終了します。  
-> 逆にデフォルトでは、プログラムを終了せずにデコーダーなしで処理を続行します。
-
-> [!IMPORTANT]  
-> **v1.2.4 で、長年の課題だった [#110](https://github.com/kazuki0824/recisdb-rs/issues/110) の CS で大量にパケットがドロップする問題が解決されました！**  
-> CS のリアルタイム視聴や録画でも、パケットドロップなく安定してご利用いただけます。  
-> もしまだ問題が発生している場合には、[Issues](https://github.com/kazuki0824/recisdb-rs/issues) にてご報告いただけると幸いです。
-
-`recisdb decode` : 指定された入力ファイルを ARIB STD-B25 に基づきデコードし、指定された出力先に TS データを書き出します。  
-```bash
-recisdb decode [OPTIONS] --input <file> <OUTPUT>
+sudo apt update
+sudo apt install -y build-essential cmake libclang-dev libpcsclite-dev libudev-dev pkg-config
 ```
 
-詳しいオプションは `recisdb --help` / `recisdb <SUBCOMMAND> --help` を参照してください。
-
-### Channel
-
-`-c` または `--channel` でのチャンネル指定フォーマットは下記の通りです。  
-**recpt1 のチャンネル指定フォーマットとは微妙に異なるため注意してください。**
-
-- `-c T27` (地上波: 27ch)
-  - recpt1 では単に 27 と指定するが、recisdb では T27 と指定する
-- `-c T60` (地上波: 60ch)
-  - 通常地上波の物理チャンネルは 52ch までだが、CATV のコミュニティチャンネルでは 62ch まで使われていることがある
-- `-c C30` (CATV: 30ch)
-  - ISDB-T の CATV チャンネルでは C を付ける
-- `-c BS1_0` (BS: BS01/TS0)
-  - BS01_0 と BS1_0 の両方のフォーマットに対応
-- `-c BS03 --tsid 16433` (BS: BS03/TS1 (TSID = 0x4031))
-  - BS ではスロット (相対 TS 番号) の代わりに TSID を指定して選局することも可能
-  - この例では明示的に BS03 (トランスポンダ) の中から TSID = 0x4031 を持つ TS (NHK BSプレミアム) を選局している
-- `-c BS23_3` (BS: BS23/TS3)
-- `-c CS02` (CS: ND02)
-  - CS2 と CS02 の両方のフォーマットに対応
-- `-c CS24` (CS: ND24)
-
-> [!IMPORTANT]  
-> 現時点では、ISDB-T / ISDB-S 以外の放送方式 (ISDB-C / DVB-S2 など) には対応していません。
-
-> [!NOTE]  
-> **接続/認識されているチューナーデバイスの確認やチャンネルスキャンには、recisdb をチューナーコマンドとして利用する [ISDBScanner](https://github.com/tsukumijima/ISDBScanner) が便利です。**  
-> 受信可能な日本のテレビチャンネル (ISDB-T/ISDB-S) を全自動でスキャンし、スキャン結果を EDCB (EDCB-Wine)・Mirakurun・mirakc の各設定ファイルや JSON 形式で出力できます。
-
-### Linux
-
-Linux では、キャラクタデバイス (chardev) または DVBv5 デバイスを指定して選局します。
-
-> [!NOTE]  
-> **DVB デバイスのサポートは v1.2.0 から追加されたものです。**  
-> v1.1.0 以前のバージョンでは、DVB デバイスを操作することはできません。
-
-> [!WARNING]  
-> **DVB 版ドライバ利用時のみ、BS の選局にはスロット番号 (相対 TS 番号) ではなく、recisdb 本体にハードコードされた各スロットと TSID の対照表が利用されます。**  
-> DVB 版ドライバでは DVBv5 API の仕様上、BS のみ選局時に TSID を明示的に指定する必要があります。しかし DVB 版ドライバではチューナーが持つ TMCC 情報へのアクセス手段がないため、選局に必要な TSID を相対 TS 番号から算出することができません。   
-> このため、**もし今後 BS の帯域再編が行われた場合、帯域再編後も DVB 版ドライバで BS を受信するには、`--tsid` で TSID を明示的に指定するか、recisdb 自体を新バージョンへ更新する必要があります。**
-
-> [!WARNING]  
-> **chardev 版ドライバで `--tsid` オプションの指定に対応しているのは [tsukumijima/px4_drv](https://github.com/tsukumijima/px4_drv) v0.4.0 以降のみです。**  
-> これ以外の chardev 版ドライバ ([pt3_drv](https://github.com/m-tsudo/pt3) など) では `--tsid` 指定は動作しないものと思われます。  
-> DVB 版ドライバはすべて `--tsid` オプションの指定に対応しています。
-
-#### Examples
+### 2. リポジトリの取得とビルド
 
 ```bash
-# キャラクタデバイスをオープンし、地上波 18ch を選局し、信号レベル (dB) を確認
-recisdb checksignal --device /dev/px4video2 --channel T18
+git clone --recursive https://github.com/<ユーザー名>/recisdb-catv.git
+cd recisdb-catv
 
-# DVB デバイス (/dev/dvb/adapter1/frontend0) をオープンし、地上波 27ch を選局し、スクランブル解除せずに /tmp/recorded.m2ts に保存
-recisdb tune --device /dev/dvb/adapter1/frontend0 -c T27 --no-decode /tmp/recorded.m2ts
+# リリースビルド
+cargo build --release
 
-# キャラクタデバイスをオープンし、CATV (ISDB-T) 30ch を選局し、30 秒間の録画データを recorded.m2ts に保存
-recisdb tune --device /dev/px4video3 --channel C30 --time 30 recorded.m2ts
-
-# キャラクタデバイスをオープンし、BS03 の相対 TS 番号 1 を選局し、パイプ渡しで ffplay で再生
-recisdb tune --device /dev/px4video0 --channel BS3_1 - | ffplay -i -
-
-# DVB デバイス (/dev/dvb/adapter0/frontend0) をオープンし、BS03 の相対 TS 番号 1 を選局し (LNB 給電あり: 15V)、20 秒間の録画データを recorded.m2ts に保存
-recisdb tune --device /dev/dvb/adapter0/frontend0 -c BS03_1 --lnb 15v --time 20 recorded.m2ts
-
-# 略記法で DVB デバイス (/dev/dvb/adapter2/frontend0) をオープンし、BS03 (TSID = 0x4031) を選局し、スクランブル解除せずに sudo tee で /root/recorded.m2ts に保存
-recisdb tune --device "2|0" -c BS3 --tsid 0x4031 --no-decode - | sudo tee /root/recorded.m2ts > /dev/null
-
-# キャラクタデバイスをオープンし、CS04 を選局し、スクランブル解除せずに /tmp/recorded.m2ts に保存
-recisdb tune --device /dev/px4video5 -c CS04 --no-decode /tmp/recorded.m2ts
-
-# スクランブル解除されていない $HOME/scrambled.m2ts をNULL パケットの除去を行わずにスクランブル解除し、descrambled.m2ts に保存
-recisdb decode -i $HOME/scrambled.m2ts --no-strip ./descrambled.m2ts
-```
-
-### Windows
-
-Windows では、BonDriver のファイルパスと、BonDriver 上のチャンネル空間番号 / チャンネル通し番号を指定して選局します。  
-**BonDriver インターフェイスの技術的制約により、Linux 版とはチャンネル指定方法が異なるため注意してください。**
-
-- チャンネル: `<ChannelSpace>-<Channel>` のフォーマット (例: `1-12`) で指定
-- デバイス: BonDriver (.dll) へのファイルパスを指定
-
-> [!WARNING]  
-> **Windows (BonDriver) 対応は実験的なものであり、動作検証はあまり行われていません。**  
-> **このため、一部の BonDriver やチューナーでは正常に動作しない可能性があります。**  
-> また、現時点では Windows 版には `recisdb checksignal` は実装されていません。
-
-#### Examples
-
-```powershell
-# BonDriver_mirakc.dll をオープンし、チャンネル空間番号:0 / チャンネル通し番号:8 を選局し、録画データを recorded.m2ts に保存
-recisdb.exe tune --device .\BonDriver_mirakc.dll -c 0-8 -t 20 recorded.m2ts
-
-# スクランブル解除されていない %USERPROFILE%\Desktop\scrambled.m2ts をスクランブル解除し、descrambled.m2ts に保存
-recisdb.exe decode -i %USERPROFILE%\Desktop\scrambled.m2ts .\descrambled.m2ts
+# 実行バイナリを配置
+sudo cp target/release/recisdb-catv /usr/local/bin/
 ```
 
 ---
 
-## Build
+## 使い方（Usage）
 
-recisdb をビルドするには Rust が必要です。  
-Rust がインストールされていない場合は、[Rustup](https://www.rust-lang.org/ja/tools/install) をインストールしてください。
+`recisdb-catv` は以下のサブコマンドに対応しています。
 
-### Ubuntu / Debian
+* `tune`: チャンネルを選局し、TS データを録画または標準出力にストリーミングします。
+* `scan`: CATV 帯域を走査し、Mirakurun 用の `channels.yml` を自動生成します。
+* `checksignal`: 信号の受信状態や CNR（信号品質）を確認します。
+* `decode`: ARIB STD-B25 に基づき、スクランブルされた TS ファイルをデコードします。
 
-> [!NOTE]  
-> 以下のコマンドは Ubuntu 22.04 でのインストール方法です。
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-上記のコマンドで Rustup をインストールできます。  
-Rustup をインストールするだけで、Rust とビルドに必要なツールチェーンが同時にインストールされます。
+### コマンド構文
 
 ```bash
-# リポジトリを submodule を含めて clone
-git clone --recursive https://github.com/kazuki0824/recisdb-rs.git
-cd recisdb-rs
+# 録画・ストリーミング
+recisdb-catv tune [OPTIONS] -i <デバイス> -c <チャンネル> [OUTPUT]
 
-# 依存パッケージをインストール
-sudo apt install -y build-essential libclang-dev cmake libdvbv5-dev libpcsclite-dev libudev-dev pkg-config
+# チャンネルスキャン
+recisdb-catv scan -i <デバイス> -o <出力YAMLファイル>
 
-# ビルド
-## -F dvb を指定すると libdvbv5 経由での DVB デバイスの操作がサポートされる
-cargo build -F dvb --release
+# 信号レベル確認
+recisdb-catv checksignal -i <デバイス> -c <チャンネル>
 
-# インストール
-sudo cp -a target/release/recisdb /usr/local/bin
-
-# または、cargo install でインストール
-cargo install -F dvb --path recisdb-rs
+# 単体デコード
+recisdb-catv decode -i <入力ファイル> <出力ファイル>
 ```
-
-Rust をインストールしたら、上記のコマンドで recisdb をビルドできます。  
-ビルドした recisdb は、`target/release/recisdb` に生成されます。
-
-`cargo install` を使うと、パスの通った場所へ実行ファイルを自動的に配置できます。
-
-> [!IMPORTANT]  
-> `cargo build` を実行する際、`-F dvb` を指定すると libdvbv5 経由での DVB デバイスの操作がサポートされます。  
-> `-F dvb` を指定してビルドした場合、動作には別途 `libdvbv5-0` パッケージが必要になります。
-
-### macOS (decode only)
-
-macOS では `decode` サブコマンドのみ利用できます。
-macOS SDK に標準搭載されている `PCSC.framework` を使用するため、Homebrew の `pcsc-lite`、`pkg-config`、
-`PKG_CONFIG_PATH` は必要ありません。Xcode Command Line Tools と Rust、CMake 3.15 以上を用意してください。
-
-```bash
-cargo build -p recisdb --release
-
-target/release/recisdb decode -i scrambled.m2ts descrambled.m2ts
-```
-
-### Windows (MSVC)
-
-執筆中…
-
-### Windows (MSYS MinGW)
-
-執筆中…
 
 ---
 
-## Licence
+## チャンネル指定フォーマット（-c / --channel）
 
-[GPL v3](https://github.com/kazuki0824/recisdb-rs/blob/master/LICENSE)
+### 1. ケーブルテレビ / CATV（ISDB-C / トランスモジュレーション）
+* `-c C50` : CATV C50ch（NHK BS トランスモジュレーション波など）
+* `-c C53` : CATV C53ch（BS日テレなど）
+* `-c C28` : CATV C28ch（コミュニティチャンネル・自主放送など）
+* `-c C30_1` または `-c C30:1` : CATV C30ch の TSMF スロット 1 のみを分離選局
 
-## Author
+### 2. 地上デジタル（ISDB-T）
+* `-c 27` または `-c T27` : 地上波 27ch
 
-[maleicacid](https://github.com/kazuki0824)
+### 3. BS / CS（衛星直受け時）
+* `-c BS01_0` : BS01 の相対 TS 番号 0
+* `-c CS02` : CS ND02
 
-## Special thanks
+> [!TIP]
+> Mirakurun や録画コマンドでは、放送種別を明示する `-t` / `--type` オプション（`GR`, `BS`, `CATV`, `CS`）を併用できます。
+> 例: `recisdb-catv tune -i /dev/tbs6281video0 -c C50 -t BS recorded.ts`
 
-このアプリケーションは [px4_drv](https://github.com/nns779/px4_drv) を参考にして実装されています。  
-また [libaribb25](https://github.com/tsukumijima/libaribb25) のラッパー実装を含んでいます。
+---
 
-This application has been implemented with reference to [px4_drv](https://github.com/nns779/px4_drv).  
-It also contains a wrapper implementation of [libaribb25](https://github.com/tsukumijima/libaribb25).
+## コマンド実行例（Examples）
+
+TBS6281SE v2（`/dev/tbs6281video*`）を使用する場合の代表的なコマンド例です。
+
+### 1. チャンネルスキャン（Mirakurun 用 channels.yml 自動生成）
+```bash
+# CATV 全帯域をスキャン（専門チャンネルを type: CS として出力・推奨）
+recisdb-catv scan -i /dev/tbs6281video0 -o /etc/mirakurun/channels.yml
+
+# CATV 専門チャンネルを type: CATV として出力する場合
+recisdb-catv scan -i /dev/tbs6281video0 --catv -o /etc/mirakurun/channels.yml
+```
+
+### 2. CATV（BS トランスモジュレーション）の録画
+```bash
+# NHK BS（C50ch）を B25 デコードしながら 10 秒間録画
+recisdb-catv tune -i /dev/tbs6281video0 -c C50 -t BS --time 10 nhk_bs.ts
+
+# BS日テレ（C53ch）をデコードなし（生TS）で録画
+recisdb-catv tune -i /dev/tbs6281video0 -c C53 -t BS --no-decode --time 10 bs_ntv.ts
+```
+
+### 3. 地上波の信号確認・録画
+```bash
+# 地上波 27ch の信号レベル（CNR）を確認
+recisdb-catv checksignal -i /dev/tbs6281video0 -c 27
+
+# 地上波 27ch を録画
+recisdb-catv tune -i /dev/tbs6281video0 -c 27 -t GR --time 10 gr27.ts
+```
+
+### 5. TS ファイルの単体 B25 デコード
+```bash
+# スクランブルされた TS ファイルをデコード
+recisdb-catv decode -i scrambled.ts descrambled.ts
+```
+
+---
+
+## 動作確認済み環境
+
+* **OS**: Linux（Kernel 6.x / 7.x）
+* **対応ハードウェア**: TurboSight TBS6281SE v2
+* **対応ドライバ**: [m1tore/TBS6281SEv2_drv](https://github.com/m1tore/TBS6281SEv2_drv)（PTX 互換キャラクタデバイスドライバ）
+
+※Windows および macOS での動作検証は行っておりません。
+
+---
+
+## ライセンス（License）
+
+本ソフトウェアは [GPL v3](LICENSE) の下で公開されています。

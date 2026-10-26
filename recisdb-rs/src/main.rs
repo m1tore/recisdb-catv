@@ -19,6 +19,12 @@ fn main() {
 
     utils::initialize_logger();
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let context::Commands::Scan { device, output, timeout_ms, catv } = arg.command {
+        commands::scan::run_scan(device, output, timeout_ms, catv);
+        return;
+    }
+
     // Get Future
     let (fut, timeout_option, progress) = commands::process_command(arg);
 
